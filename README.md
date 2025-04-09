@@ -1,4 +1,4 @@
-# Web of Science (WOS) Downloader App
+# Web of Science Downloader
 
 ## Overview
 
