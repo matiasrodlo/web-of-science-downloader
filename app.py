@@ -3,6 +3,7 @@ import os
 import sys
 import random
 import re
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -48,18 +49,8 @@ st.markdown(
     """, unsafe_allow_html=True
 )
 
-# Define variable delays to emulate human behavior
-DOWNLOAD_DELAY_MIN = 5   # minimum delay in seconds
-DOWNLOAD_DELAY_MAX = 15  # maximum delay in seconds
-
-def random_delay():
-    delay = random.uniform(DOWNLOAD_DELAY_MIN, DOWNLOAD_DELAY_MAX)
-    st.info(f"Waiting for {delay:.1f} seconds to emulate human behavior...")
-    time.sleep(delay)
-
-# --- File renaming helper functions ---
+# --- File Naming Helper Functions ---
 def sanitize_query(query):
-    """Sanitize the search query to create a filename-friendly string."""
     query_clean = query.strip().lower().replace(" ", "_")
     query_clean = re.sub(r'[^a-z0-9_]', '', query_clean)
     return query_clean
@@ -69,203 +60,140 @@ def generate_filename(query, start_record, end_record, prefix="WOS"):
     filename = f"{prefix}_{query_clean}_{start_record}-{end_record}.bib"
     return filename
 
-# Default downloaded file name (adjust if needed based on your Chrome settings)
 DEFAULT_DOWNLOAD_NAME = "WOS_Output.bib"
+DOWNLOAD_DELAY_MIN = 5
+DOWNLOAD_DELAY_MAX = 15
+
+# --- New download folder path (for renamed files) ---
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "downloads")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def random_delay():
+    delay = random.uniform(DOWNLOAD_DELAY_MIN, DOWNLOAD_DELAY_MAX)
+    st.info(f"Waiting for {delay:.1f} seconds to emulate human behavior...")
+    time.sleep(delay)
+
+def find_recent_bib_file(directory, time_limit=300):
+    """
+    Look for any file with .bib extension in the given directory 
+    that was modified within the last `time_limit` seconds.
+    """
+    try:
+        bib_files = [
+            os.path.join(directory, f)
+            for f in os.listdir(directory)
+            if f.lower().endswith('.bib')
+        ]
+    except Exception as e:
+        st.info(f"Error listing directory {directory}: {e}")
+        return None
+
+    if not bib_files:
+        return None
+    current_time = time.time()
+    # Return files modified in the last time_limit seconds
+    recent_files = [f for f in bib_files if (current_time - os.path.getmtime(f)) < time_limit]
+    if recent_files:
+        recent_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+        return recent_files[0]
+    return None
+
+def get_download_path():
+    """
+    Check both the custom OUTPUT_DIR and the default system Downloads folder
+    for either a file named DEFAULT_DOWNLOAD_NAME or any recent .bib file.
+    """
+    # First check the expected file in OUTPUT_DIR
+    custom_path = os.path.join(OUTPUT_DIR, DEFAULT_DOWNLOAD_NAME)
+    if os.path.exists(custom_path):
+        st.info("Found file in custom downloads folder by expected name.")
+        return custom_path
+
+    # Then check the system's default Downloads folder
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    default_path = os.path.join(downloads_dir, DEFAULT_DOWNLOAD_NAME)
+    if os.path.exists(default_path):
+        st.info("Found file in system default Downloads folder by expected name.")
+        return default_path
+
+    # If not found by expected name, search for any recent .bib file
+    st.info("Expected file not found; searching for any .bib file...")
+    recent_custom = find_recent_bib_file(OUTPUT_DIR)
+    if recent_custom:
+        st.info(f"Found .bib file in custom folder: {recent_custom}")
+        return recent_custom
+
+    recent_default = find_recent_bib_file(downloads_dir)
+    if recent_default:
+        st.info(f"Found .bib file in default Downloads folder: {recent_default}")
+        return recent_default
+
+    st.info("No .bib file found in either location yet.")
+    # Return the custom expected path as a fallback.
+    return custom_path
+
+def wait_for_download(timeout=60, poll_frequency=1):
+    """
+    Polls until a .bib file is found in either expected location.
+    Returns the file path if found, or None if timeout reached.
+    """
+    start_time = time.time()
+    file_path = None
+    while time.time() - start_time < timeout:
+        file_path = get_download_path()
+        if file_path and os.path.exists(file_path):
+            return file_path
+        time.sleep(poll_frequency)
+    return None
 
 def create_driver():
     options = Options()
-    current_directory = os.path.dirname(os.path.abspath(__file__))
-    if sys.platform.startswith("linux"):
-        chrome_path = "/usr/bin/google-chrome"  # or "/usr/bin/chromium-browser"
-        chromedriver_path = "/usr/local/bin/chromedriver"  # Adjust if different
-    elif sys.platform.startswith("win"):
-        chrome_path = os.path.join(current_directory, r"Chrome/Application/chrome.exe")
-        chromedriver_path = os.path.join(current_directory, r"Chromedriver/chromedriver.exe")
-    else:
-        st.error("Unsupported platform")
+    # When attaching to an existing Chrome session using debugger_address,
+    # do not add custom download preferences.
+    options.debugger_address = "127.0.0.1:9222"
+    try:
+        driver = webdriver.Chrome(options=options)
+        driver.maximize_window()
+        return driver
+    except Exception as e:
+        st.error(f"Could not connect to existing Chrome session: {e}")
         return None
-
-    options.binary_location = chrome_path
-    service = Service(executable_path=chromedriver_path)
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.maximize_window()
-    return driver
 
 def main():
     st.title("WOS Downloader App")
     url = st.text_input("Enter URL")
-    # New text input for the search query for naming purposes
     search_query = st.text_input("Enter search query (for filename)", value="")
-    
-    # Save the query in session state for later use
     if search_query:
         st.session_state.search_query = search_query
 
-    # Button to start and open Chrome
-    if st.button("Start and open Chrome") and url:
+    if st.button("Attach to existing Chrome session") and url:
         if "driver" not in st.session_state:
             driver = create_driver()
             if driver is None:
                 return
             st.session_state.driver = driver
             driver.get(url)
-            st.info("Chrome has been opened with the given URL. **Please log in manually** in the Chrome window. Once logged in, click the **Continue after logging in** button below.")
+            st.info("Chrome session attached. Please log in manually. Then click 'Continue after logging in'.")
         else:
-            st.info("Driver already running. Please log in manually in the Chrome window.")
+            st.info("Driver already attached.")
 
-    # Button for continuing after manual login
     if "driver" in st.session_state and st.button("Continue after logging in"):
         driver = st.session_state.driver
-        time.sleep(5)  # Brief pause for page stabilization
-
+        time.sleep(5)
         if is_university_front_page(driver):
             download_data_university(driver)
         elif is_other_network_front_page(driver):
             download_data_other_network(driver)
         else:
-            st.error("Front page not recognized. Cannot proceed with download.")
-        
+            st.error("Front page not recognized.")
         driver.quit()
         del st.session_state.driver
 
 def is_university_front_page(driver):
     try:
-        driver.find_element(By.ID, "onetrust-close-btn-container")
-        return True
+        return bool(driver.find_elements(By.ID, "onetrust-close-btn-container") or driver.find_elements(By.TAG_NAME, "app-export-menu"))
     except Exception:
         return False
-
-def download_data_university(driver):
-    # Close any pop-ups if available.
-    try:
-        onetrust_banner = WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.ID, "onetrust-close-btn-container"))
-        )
-        onetrust_banner.click()
-        tour_close_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "[aria-label='Close this tour']"))
-        )
-        tour_close_button.click()
-    except TimeoutException:
-        pass
-
-    n_result_text = driver.find_element(By.CLASS_NAME, "brand-blue").text  
-    n_result = int(n_result_text.replace(",", ""))
-    n_iter = math.ceil(n_result / 500)
-    TIME_GAP = 1
-    progress_bar = st.progress(0)
-
-    for iter in range(n_iter):
-        progress_text = f"Downloading {iter + 1} out of {n_iter} file(s). Please don't close the browser."
-        progress_bar.progress((iter + 1) / n_iter, text=progress_text)
-        time.sleep(TIME_GAP)
-
-        # Click the export menu.
-        try:
-            export_menu = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.TAG_NAME, "app-export-menu"))
-            )
-            export_menu.click()
-        except TimeoutException:
-            st.error("Export menu not clickable.")
-            continue
-
-        random_delay()
-        
-        # Select the Bib format option using the new selector.
-        try:
-            bib_option = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "#mat-menu-panel-13 > div > div > div:nth-child(7)"))
-            )
-            bib_option.click()
-        except TimeoutException:
-            st.error("Bib format option not found.")
-            continue
-
-        random_delay()
-        
-        # Click the radio button for record content selection.
-        try:
-            radio_btn = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "[for='radio3-input']"))
-            )
-            radio_btn.click()
-        except TimeoutException:
-            st.error("Radio button [for='radio3-input'] not clickable. Please verify the selector.")
-            continue
-
-        random_delay()
-        
-        # Input the record range.
-        from_rec, to_rec = 500 * iter + 1, 500 * (iter + 1)
-        input_elements = driver.find_elements(By.CLASS_NAME, "mat-input-element")
-        if len(input_elements) >= 2:
-            input_el_from, input_el_to = input_elements[0], input_elements[1]
-            input_el_from.clear()
-            input_el_from.send_keys(from_rec)
-            input_el_to.clear()
-            input_el_to.send_keys(to_rec)
-        else:
-            st.error("Record input elements not found.")
-            continue
-
-        random_delay()
-        
-        # Click the dropdown to open data options.
-        try:
-            dropdown = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CLASS_NAME, "dropdown"))
-            )
-            dropdown.click()
-        except TimeoutException:
-            st.error("Dropdown element not clickable.")
-            continue
-
-        random_delay()
-        
-        # Choose "Full Record and Cited References".
-        try:
-            data_option = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "[title='Full Record and Cited References']"))
-            )
-            data_option.click()
-        except TimeoutException:
-            st.error("Data option 'Full Record and Cited References' not found.")
-            continue
-
-        random_delay()
-        
-        # Click the Export button using selector "#exportButton".
-        try:
-            export_btn = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "#exportButton"))
-            )
-            export_btn.click()
-        except TimeoutException:
-            st.error("Export button with selector '#exportButton' not clickable.")
-            continue
-
-        # Wait until the export popup dialog is no longer visible.
-        wait = WebDriverWait(driver, 60)
-        try:
-            wait.until_not(EC.visibility_of_element_located((By.CLASS_NAME, "window")))
-        except TimeoutException:
-            st.warning("Timed out waiting for popup dialog to disappear, retrying...")
-
-        st.success(f"SUCCESS DOWNLOADED FROM {from_rec} TO {to_rec}")
-        
-        # Attempt to rename the downloaded file
-        if "search_query" in st.session_state:
-            new_filename = generate_filename(st.session_state.search_query, from_rec, to_rec)
-            if os.path.exists(DEFAULT_DOWNLOAD_NAME):
-                os.rename(DEFAULT_DOWNLOAD_NAME, new_filename)
-                st.success(f"File renamed to: {new_filename}")
-            else:
-                st.warning("Downloaded file not found for renaming.")
-        else:
-            st.warning("Search query not provided; file not renamed.")
-        
-        random_delay()
 
 def is_other_network_front_page(driver):
     try:
@@ -276,131 +204,133 @@ def is_other_network_front_page(driver):
     except Exception:
         return False
 
-def download_data_other_network(driver):
+def save_downloaded_file(from_rec, to_rec):
+    downloaded_file = wait_for_download(timeout=60)
+    if downloaded_file:
+        if "search_query" in st.session_state and st.session_state.search_query.strip() != "":
+            new_filename = generate_filename(st.session_state.search_query, from_rec, to_rec)
+        else:
+            new_filename = generate_filename("default", from_rec, to_rec)
+        destination = os.path.join(OUTPUT_DIR, new_filename)
+        try:
+            os.rename(downloaded_file, destination)
+            st.success(f"File moved to: {destination}")
+        except Exception as e:
+            st.error(f"Error renaming file: {e}")
+    else:
+        st.warning("Downloaded file not found after waiting.")
+
+def download_data_university(driver):
     try:
-        sign_in_button = driver.find_element(By.ID, "signIn-btn")
-        WebDriverWait(driver, 300).until(EC.invisibility_of_element(sign_in_button))
-        time.sleep(10)
-        onetrust_banner = WebDriverWait(driver, 10).until(
-            EC.visibility_of_element_located((By.ID, "onetrust-close-btn-container"))
-        )
-        onetrust_banner.click()
-        tour_close_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "[aria-label='Close this tour']"))
-        )
-        tour_close_button.click()
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "onetrust-close-btn-container"))).click()
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "[aria-label='Close this tour']"))).click()
     except TimeoutException:
         pass
 
-    n_result_text = driver.find_element(By.CLASS_NAME, "brand-blue").text  
+    n_result_text = driver.find_element(By.CLASS_NAME, "brand-blue").text
     n_result = int(n_result_text.replace(",", ""))
     n_iter = math.ceil(n_result / 500)
-    TIME_GAP = 1
     progress_bar = st.progress(0)
 
     for iter in range(n_iter):
-        progress_text = f"Downloading {iter + 1} out of {n_iter} file(s). Please don't close the browser."
-        progress_bar.progress((iter + 1) / n_iter, text=progress_text)
-        time.sleep(TIME_GAP)
-
+        progress_bar.progress((iter + 1) / n_iter, text=f"Downloading file {iter + 1} of {n_iter}")
+        time.sleep(1)
         try:
-            export_menu = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.TAG_NAME, "app-export-menu"))
-            )
-            export_menu.click()
-        except TimeoutException:
-            st.error("Export menu not clickable.")
-            continue
-
-        random_delay()
-        
-        try:
-            bib_option = WebDriverWait(driver, 15).until(
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.TAG_NAME, "app-export-menu"))).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "#mat-menu-panel-13 > div > div > div:nth-child(7)"))
-            )
-            bib_option.click()
-        except TimeoutException:
-            st.error("Bib format option not found.")
-            continue
-
-        random_delay()
-        
-        try:
-            radio_btn = WebDriverWait(driver, 15).until(
+            ).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "[for='radio3-input']"))
-            )
-            radio_btn.click()
-        except TimeoutException:
-            st.error("Radio button [for='radio3-input'] not clickable.")
-            continue
-
-        random_delay()
-        
-        from_rec, to_rec = 500 * iter + 1, 500 * (iter + 1)
-        input_elements = driver.find_elements(By.CLASS_NAME, "mat-input-element")
-        if len(input_elements) >= 2:
-            input_el_from, input_el_to = input_elements[0], input_elements[1]
-            input_el_from.clear()
-            input_el_from.send_keys(from_rec)
-            input_el_to.clear()
-            input_el_to.send_keys(to_rec)
-        else:
-            st.error("Record input elements not found.")
-            continue
-
-        random_delay()
-        
-        try:
-            dropdown = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CLASS_NAME, "dropdown"))
-            )
-            dropdown.click()
-        except TimeoutException:
-            st.error("Dropdown element not clickable.")
-            continue
-
-        random_delay()
-        
-        try:
-            data_option = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "[title='Full Record and Cited References']"))
-            )
-            data_option.click()
-        except TimeoutException:
-            st.error("Data option 'Full Record and Cited References' not found.")
-            continue
-
-        random_delay()
-        
-        try:
-            export_btn = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "#exportButton"))
-            )
-            export_btn.click()
-        except TimeoutException:
-            st.error("Export button with selector '#exportButton' not clickable.")
-            continue
-
-        wait = WebDriverWait(driver, 60)
-        try:
-            wait.until_not(EC.visibility_of_element_located((By.CLASS_NAME, "window")))
-        except TimeoutException:
-            st.warning("Timed out waiting for popup dialog to disappear, retrying...")
-
-        st.success(f"SUCCESS DOWNLOADED FROM {from_rec} TO {to_rec}")
-        
-        # Rename downloaded file using the search query, record range, and prefix.
-        if "search_query" in st.session_state:
-            new_filename = generate_filename(st.session_state.search_query, from_rec, to_rec)
-            if os.path.exists(DEFAULT_DOWNLOAD_NAME):
-                os.rename(DEFAULT_DOWNLOAD_NAME, new_filename)
-                st.success(f"File renamed to: {new_filename}")
+            ).click()
+            random_delay()
+            from_rec, to_rec = 500 * iter + 1, 500 * (iter + 1)
+            input_elements = driver.find_elements(By.CLASS_NAME, "mat-input-element")
+            if len(input_elements) >= 2:
+                input_elements[0].clear()
+                input_elements[0].send_keys(from_rec)
+                input_elements[1].clear()
+                input_elements[1].send_keys(to_rec)
             else:
-                st.warning("Downloaded file not found for renaming.")
-        else:
-            st.warning("Search query not provided; file not renamed.")
-        
-        random_delay()
+                st.error("Record range inputs not found.")
+                continue
+            random_delay()
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CLASS_NAME, "dropdown"))).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "[title='Full Record and Cited References']"))
+            ).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "#exportButton"))
+            ).click()
+            WebDriverWait(driver, 60).until_not(EC.visibility_of_element_located((By.CLASS_NAME, "window")))
+            st.success(f"SUCCESS: Downloaded records {from_rec} to {to_rec}")
+            save_downloaded_file(from_rec, to_rec)
+            random_delay()
+        except TimeoutException:
+            st.error("Timeout during one of the export steps.")
+            continue
+
+def download_data_other_network(driver):
+    try:
+        WebDriverWait(driver, 300).until(EC.invisibility_of_element((By.ID, "signIn-btn")))
+        time.sleep(10)
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "onetrust-close-btn-container"))).click()
+        WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "[aria-label='Close this tour']"))
+        ).click()
+    except TimeoutException:
+        pass
+
+    n_result_text = driver.find_element(By.CLASS_NAME, "brand-blue").text
+    n_result = int(n_result_text.replace(",", ""))
+    n_iter = math.ceil(n_result / 500)
+    progress_bar = st.progress(0)
+
+    for iter in range(n_iter):
+        progress_bar.progress((iter + 1) / n_iter, text=f"Downloading file {iter + 1} of {n_iter}")
+        time.sleep(1)
+        try:
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.TAG_NAME, "app-export-menu"))).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "#mat-menu-panel-13 > div > div > div:nth-child(7)"))
+            ).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "[for='radio3-input']"))
+            ).click()
+            random_delay()
+            from_rec, to_rec = 500 * iter + 1, 500 * (iter + 1)
+            input_elements = driver.find_elements(By.CLASS_NAME, "mat-input-element")
+            if len(input_elements) >= 2:
+                input_elements[0].clear()
+                input_elements[0].send_keys(from_rec)
+                input_elements[1].clear()
+                input_elements[1].send_keys(to_rec)
+            else:
+                st.error("Record range inputs not found.")
+                continue
+            random_delay()
+            WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.CLASS_NAME, "dropdown"))).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "[title='Full Record and Cited References']"))
+            ).click()
+            random_delay()
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "#exportButton"))
+            ).click()
+            WebDriverWait(driver, 60).until_not(EC.visibility_of_element_located((By.CLASS_NAME, "window")))
+            st.success(f"SUCCESS: Downloaded records {from_rec} to {to_rec}")
+            save_downloaded_file(from_rec, to_rec)
+            random_delay()
+        except TimeoutException:
+            st.error("Timeout during one of the export steps.")
+            continue
 
 if __name__ == "__main__":
     main()
